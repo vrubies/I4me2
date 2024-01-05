@@ -20,24 +20,39 @@ class LLMForecaster(nn.Module):
     def __init__(self, frozenGPT, config):
         super(LLMForecaster, self).__init__()
         self.frozenGPT = frozenGPT
+        GPT_params = self.frozenGPT.get_num_params()
         self.num_outputs = 1 
+        self.block_size = config.block_size
 
         # Merges the hidden states from the GPT model
-        self.hidden_merger = nn.ModuleList([nn.Linear(config.n_embd, config.n_embd, bias=config.bias) for _ in range(config.n_layer)])
+        self.hidden_merger = nn.ModuleList([nn.Linear(config.n_embd, config.n_embd, bias=config.bias) for _ in range(config.n_layer + 1)])
 
         # Full text convolutional information
-        self.context_length_multiplier = 10
-        self.max_tokens = config.block_size * self.context_length_multiplier 
-        self.stride = config.block_size // 2 #between 1 and config.block_size
-        self.num_chunks = (self.max_tokens - config.block_size) // self.stride + 1
+        self.context_length_multiplier = 2
+        self.max_tokens = self.block_size * self.context_length_multiplier 
+        target_stride = self.block_size // 2
+        self.stride = None
+        print("target_stride", target_stride)
+        offset = 0
+        while (target_stride - offset > 0) and (target_stride + offset < self.block_size):
+            for stride in [target_stride - offset, target_stride + offset]:
+                if stride > 0 and (self.max_tokens - self.block_size) % stride == 0:
+                    self.stride = stride
+            if self.stride is not None:
+                break
+            offset += 1
+        self.num_chunks = (self.max_tokens - self.block_size) // self.stride + 1
+        print("max_tokens", self.max_tokens)
+        print("stride", self.stride)
+        print("num_chunks", self.num_chunks)
 
         # Individual chunk convolutional information
         # Will go from (B, n_embed, T) -> (B, 50, T // 2) -> (B, 1, T // 4)
-        self.kernel_size_1 = config.block_size // 2
-        self.conv_dim_1 = 100
-        resulting_len_1 = (config.block_size - self.kernel_size_1) + 1
-        self.kernel_size_2 = self.kernel_size_1 // 2
-        self.conv_dim_2 = 50
+        self.kernel_size_1 = self.block_size // 4
+        self.conv_dim_1 = 50
+        resulting_len_1 = (self.block_size - self.kernel_size_1) + 1
+        self.kernel_size_2 = self.kernel_size_1 // 4
+        self.conv_dim_2 = 10
         resulting_len_2 = (resulting_len_1 - self.kernel_size_2) + 1
 
         self.conv_blocks_1 = nn.ModuleList([
@@ -51,32 +66,36 @@ class LLMForecaster(nn.Module):
         self.linear_relu_dim = 300
         self.linear_relu = nn.Sequential(nn.Linear(self.num_chunks * resulting_len_2 * self.conv_dim_2, self.linear_relu_dim, bias=config.bias), nn.ReLU())
         self.linear_output = nn.Linear(self.linear_relu_dim, self.num_outputs, bias=config.bias)
+        print("number of parameters: %.2fM" % ((self.get_num_params() - GPT_params)/1e6,))
+
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters())
 
     def forward(self, idx):
-        B, T, C = idx.size() # (b, t, n_embd)
+        B, T = idx.size() # (b, t, n_embd)
         assert T <= self.max_tokens, f"Cannot forward sequence of length {T}, block size is over {self.max_tokens}"
 
-        # Split the input into chunks of size B, config.block_size, C
-        assert T % self.num_chunks != 0, f"Cannot split sequence of length {T} into {self.num_chunks} chunks"
-        chunks = torch.split(idx, T // self.num_chunks, dim=1)
+        # Split the input into chunks of size B, self.block_size, C
+        chunks = []
+        for i in range(self.num_chunks):
+            chunks.append(idx[:, i*self.stride:i*self.stride+self.block_size])
+            # print("Shape of chunk: ",chunks[-1].shape)
 
         # Run the GPT model on each chunk
         all_processed_chunks = []
         for c in chunks:
             hidden_states = self.frozenGPT(c, targets=None, return_hid=True)
-            hidden_merged = torch.zeros_like(c) # (B, T // self.num_chunks, C)
-            assert len(hidden_states) == len(self.hidden_merger)
+            hidden_merged = torch.zeros_like(hidden_states[0]) # (B, T // self.num_chunks, C)
+            assert len(hidden_states) == len(self.hidden_merger), f"Number of hidden states ({len(hidden_states)}) does not match number of hidden mergers ({len(self.hidden_merger)})"
             for h,m in zip(hidden_states, self.hidden_merger):
                 hidden_merged += m(h)
+            # print("B - hidden_merged.shape", hidden_merged.shape) # (B, T // self.num_chunks, C)
             all_processed_chunks.append(hidden_merged)
-            
+
         outputs_to_MLP = []
-        for c in all_processed_chunks:
-            # Run the convolutional layers on each chunk
-            c = c.transpose(1, 2) # dimesions will be (B, C, T // self.num_chunks)
-            for conv_block_1, conv_block_2 in zip(self.conv_blocks_1, self.conv_blocks_2):
-                c = conv_block_1(c)
-                c = conv_block_2(c)
+        for c, conv_block_1, conv_block_2 in zip(all_processed_chunks, self.conv_blocks_1, self.conv_blocks_2):
+            c = conv_block_1(c.transpose(1, 2))
+            c = conv_block_2(c)
             outputs_to_MLP.append(c)
         outputs_to_MLP = torch.cat(outputs_to_MLP, dim=2)
 
