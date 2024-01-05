@@ -15,6 +15,104 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+class LLMForecaster(nn.Module):
+
+    def __init__(self, frozenGPT, config):
+        super(LLMForecaster, self).__init__()
+        self.frozenGPT = frozenGPT
+        self.num_outputs = 1 
+
+        # Merges the hidden states from the GPT model
+        self.hidden_merger = nn.ModuleList([nn.Linear(config.n_embd, config.n_embd, bias=config.bias) for _ in range(config.n_layer)])
+
+        # Full text convolutional information
+        self.context_length_multiplier = 10
+        self.max_tokens = config.block_size * self.context_length_multiplier 
+        self.stride = config.block_size // 2 #between 1 and config.block_size
+        self.num_chunks = (self.max_tokens - config.block_size) // self.stride + 1
+
+        # Individual chunk convolutional information
+        # Will go from (B, n_embed, T) -> (B, 50, T // 2) -> (B, 1, T // 4)
+        self.kernel_size_1 = config.block_size // 2
+        self.conv_dim_1 = 100
+        resulting_len_1 = (config.block_size - self.kernel_size_1) + 1
+        self.kernel_size_2 = self.kernel_size_1 // 2
+        self.conv_dim_2 = 50
+        resulting_len_2 = (resulting_len_1 - self.kernel_size_2) + 1
+
+        self.conv_blocks_1 = nn.ModuleList([
+            nn.Sequential(nn.Conv1d(config.n_embd, self.conv_dim_1, kernel_size=self.kernel_size_1), nn.ReLU())
+            for _ in range(self.num_chunks)])
+        self.conv_blocks_2 = nn.ModuleList([
+            nn.Sequential(nn.Conv1d(self.conv_dim_1, self.conv_dim_2, kernel_size=self.kernel_size_2), nn.ReLU())
+            for _ in range(self.num_chunks)])
+        
+        # Aggregate all information into a single vector and do a linear transformation
+        self.linear_relu_dim = 300
+        self.linear_relu = nn.Sequential(nn.Linear(self.num_chunks * resulting_len_2 * self.conv_dim_2, self.linear_relu_dim, bias=config.bias), nn.ReLU())
+        self.linear_output = nn.Linear(self.linear_relu_dim, self.num_outputs, bias=config.bias)
+
+    def forward(self, idx):
+        B, T, C = idx.size() # (b, t, n_embd)
+        assert T <= self.max_tokens, f"Cannot forward sequence of length {T}, block size is over {self.max_tokens}"
+
+        # Split the input into chunks of size B, config.block_size, C
+        assert T % self.num_chunks != 0, f"Cannot split sequence of length {T} into {self.num_chunks} chunks"
+        chunks = torch.split(idx, T // self.num_chunks, dim=1)
+
+        # Run the GPT model on each chunk
+        all_processed_chunks = []
+        for c in chunks:
+            hidden_states = self.frozenGPT(c, targets=None, return_hid=True)
+            hidden_merged = torch.zeros_like(c) # (B, T // self.num_chunks, C)
+            assert len(hidden_states) == len(self.hidden_merger)
+            for h,m in zip(hidden_states, self.hidden_merger):
+                hidden_merged += m(h)
+            all_processed_chunks.append(hidden_merged)
+            
+        outputs_to_MLP = []
+        for c in all_processed_chunks:
+            # Run the convolutional layers on each chunk
+            c = c.transpose(1, 2) # dimesions will be (B, C, T // self.num_chunks)
+            for conv_block_1, conv_block_2 in zip(self.conv_blocks_1, self.conv_blocks_2):
+                c = conv_block_1(c)
+                c = conv_block_2(c)
+            outputs_to_MLP.append(c)
+        outputs_to_MLP = torch.cat(outputs_to_MLP, dim=2)
+
+        # Run the MLP layers on the concatenated outputs
+        outputs = outputs_to_MLP.view(B, -1)
+        outputs = self.linear_relu(outputs)
+        outputs = self.linear_output(outputs)
+        
+        return outputs
+    
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+    
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -167,7 +265,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_hid=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -177,9 +275,14 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        hidden_states = [x]
         for block in self.transformer.h:
             x = block(x)
+            hidden_states.append(x)
         x = self.transformer.ln_f(x)
+
+        if return_hid:
+            return hidden_states
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
