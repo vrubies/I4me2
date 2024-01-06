@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 import random
+import json
 import yfinance as yf
 from datetime import datetime, timedelta
 from contextlib import nullcontext
@@ -32,7 +33,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, LLMForecaster
 
-stock_list = ["MSFT", "AAPL", "AMZN", "NVDA", "GOOGL", "META", "GOOG", "BRK.B", "TSLA", "UNH", 
+stock_list = ["MSFT", "AAPL", "AMZN", "NVDA", "GOOGL", "META", "GOOG", "TSLA", "UNH", 
               "LLY", "JPM", "AVGO", "XOM", "V", "JNJ", "PG", "MA", "HD", "MRK", "COST", "ABBV", 
               "CVX", "ADBE", "CRM", "PEP", "KO", "BAC", "WMT", "AMD", "MCD", "ACN", "NFLX", 
               "CSCO", "TMO", "INTC", "LIN", "ABT", "WFC", "CMCSA", "PFE", "DIS", "INTU", "VZ", 
@@ -41,6 +42,7 @@ stock_list = ["MSFT", "AAPL", "AMZN", "NVDA", "GOOGL", "META", "GOOG", "BRK.B", 
               "UBER", "BKNG", "MS", "UPS", "ISRG", "ELV", "MDT", "BLK", "AXP", "SBUX", "VRTX", 
               "DE", "BMY", "TJX", "GILD", "CVS", "C", "LMT", "AMT", "SCHW", "MDLZ", "SYK", "REGN", 
               "LRCX", "ADP", "PGR", "MMC", "ADI", "ETN", "CB", "MU", "PANW", "CI"]
+print("Num tickers = ", len(stock_list))
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -126,6 +128,10 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
+# Load stock history from JSON file
+with open('data/fool_articles/stock_history.json', 'r') as file:
+    stock_history = json.load(file)
+
 def split_data_folders(data_dir, val_percent=0.05):
     all_folders = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, f))]
     random.shuffle(all_folders)
@@ -141,18 +147,19 @@ def parse_date_from_folder(folder_name):
     return datetime.strptime(folder_name, "%Y-%m-%d")
 
 def get_stock_returns(date, stock_list):
-    start_date = date
-    end_date = start_date + timedelta(days=7)
+    start_date = date.strftime('%Y-%m-%d')
+    end_date = (date + timedelta(days=7)).strftime('%Y-%m-%d')
     returns = {}
+
     for stock in stock_list:
-        ticker = yf.Ticker(stock)
-        hist = ticker.history(start=start_date, end=end_date)
-        if len(hist) > 0:
-            start_price = hist.iloc[0]['Close']
-            end_price = hist.iloc[-1]['Close']
+        start_price = stock_history.get(stock, {}).get(start_date, 0)
+        end_price = stock_history.get(stock, {}).get(end_date, 0)
+
+        if start_price and end_price:
             returns[stock] = (end_price - start_price) / start_price
         else:
             returns[stock] = 0.0
+
     return returns
 
 def load_and_process_data(folder_path, max_length):
@@ -173,6 +180,7 @@ def get_batch(split, batch_size, max_length, stock_list):
 
     for _ in range(batch_size):
         selected_folder = random.choice(folders)
+        print(selected_folder)
         date = parse_date_from_folder(os.path.basename(selected_folder))
         stock_returns = get_stock_returns(date, stock_list)
 
@@ -203,6 +211,7 @@ device = torch.device(device_type)
 x_train, y_train = get_batch('train', batch_size, block_size, stock_list)
 print(x_train.shape, y_train.shape)
 print(x_train[0], y_train[0])
+print("Loader working")
 # attempt to derive vocab_size from the dataset
 # meta_path = os.path.join(data_dir, 'meta.pkl')
 # meta_vocab_size = None
