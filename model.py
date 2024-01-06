@@ -17,18 +17,18 @@ from torch.nn import functional as F
 
 class LLMForecaster(nn.Module):
 
-    def __init__(self, frozenGPT, config):
+    def __init__(self, frozenGPT, context_length_multiplier, ticker_list, config):
         super(LLMForecaster, self).__init__()
         self.frozenGPT = frozenGPT
         GPT_params = self.frozenGPT.get_num_params()
-        self.num_outputs = 1 
+        self.num_outputs = len(ticker_list)
         self.block_size = config.block_size
 
         # Merges the hidden states from the GPT model
         self.hidden_merger = nn.ModuleList([nn.Linear(config.n_embd, config.n_embd, bias=config.bias) for _ in range(config.n_layer + 1)])
 
         # Full text convolutional information
-        self.context_length_multiplier = 2
+        self.context_length_multiplier = context_length_multiplier
         self.max_tokens = self.block_size * self.context_length_multiplier 
         target_stride = self.block_size // 2
         self.stride = None

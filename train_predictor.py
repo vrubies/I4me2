@@ -20,6 +20,9 @@ import os
 import time
 import math
 import pickle
+import random
+import yfinance as yf
+from datetime import datetime, timedelta
 from contextlib import nullcontext
 
 import numpy as np
@@ -29,10 +32,21 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, LLMForecaster
 
+stock_list = ["MSFT", "AAPL", "AMZN", "NVDA", "GOOGL", "META", "GOOG", "BRK.B", "TSLA", "UNH", 
+              "LLY", "JPM", "AVGO", "XOM", "V", "JNJ", "PG", "MA", "HD", "MRK", "COST", "ABBV", 
+              "CVX", "ADBE", "CRM", "PEP", "KO", "BAC", "WMT", "AMD", "MCD", "ACN", "NFLX", 
+              "CSCO", "TMO", "INTC", "LIN", "ABT", "WFC", "CMCSA", "PFE", "DIS", "INTU", "VZ", 
+              "ORCL", "AMGN", "QCOM", "DHR", "TXN", "PM", "UNP", "IBM", "CAT", "COP", "SPGI", 
+              "BA", "NOW", "GE", "HON", "NKE", "NEE", "AMAT", "GS", "T", "RTX", "LOW", "PLD", 
+              "UBER", "BKNG", "MS", "UPS", "ISRG", "ELV", "MDT", "BLK", "AXP", "SBUX", "VRTX", 
+              "DE", "BMY", "TJX", "GILD", "CVS", "C", "LMT", "AMT", "SCHW", "MDLZ", "SYK", "REGN", 
+              "LRCX", "ADP", "PGR", "MMC", "ADI", "ETN", "CB", "MU", "PANW", "CI"]
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out-shakespeare1'
+context_length_multiplier = 2
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -44,7 +58,7 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'fool_articles/dated_articles'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -99,7 +113,7 @@ else:
     seed_offset = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+# print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -112,25 +126,83 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-# data_dir = os.path.join('data', dataset)
-# train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-# val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-# def get_batch(split):
-#     data = train_data if split == 'train' else val_data
-#     ix = torch.randint(len(data) - block_size, (batch_size,))
-#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-#     if device_type == 'cuda':
-#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-#     else:
-#         x, y = x.to(device), y.to(device)
-#     return x, y
+def split_data_folders(data_dir, val_percent=0.05):
+    all_folders = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, f))]
+    random.shuffle(all_folders)
+    num_val = int(len(all_folders) * val_percent)
+    val_folders = all_folders[:num_val]
+    train_folders = all_folders[num_val:]
+    return train_folders, val_folders
+data_dir = os.path.join('data', dataset)
+train_folders, val_folders = split_data_folders(data_dir)
+
+def parse_date_from_folder(folder_name):
+    # Assuming folder name is of the format "yyyy-mm-dd"
+    return datetime.strptime(folder_name, "%Y-%m-%d")
+
+def get_stock_returns(date, stock_list):
+    start_date = date
+    end_date = start_date + timedelta(days=7)
+    returns = {}
+    for stock in stock_list:
+        ticker = yf.Ticker(stock)
+        hist = ticker.history(start=start_date, end=end_date)
+        if len(hist) > 0:
+            start_price = hist.iloc[0]['Close']
+            end_price = hist.iloc[-1]['Close']
+            returns[stock] = (end_price - start_price) / start_price
+        else:
+            returns[stock] = 0.0
+    return returns
+
+def load_and_process_data(folder_path, max_length):
+    file_path = os.path.join(folder_path, 'dated_data.bin')
+    data = np.memmap(file_path, dtype=np.uint16, mode='r')
+
+    if len(data) > max_length:
+        start_index = random.randint(0, len(data) - max_length)
+        return data[start_index:start_index + max_length]
+    else:
+        # Pad data if shorter than max_length
+        padded_data = np.pad(data, (0, max_length - len(data)), 'constant')
+        return padded_data
+
+def get_batch(split, batch_size, max_length, stock_list):
+    folders = train_folders if split == 'train' else val_folders
+    x, y = [], []
+
+    for _ in range(batch_size):
+        selected_folder = random.choice(folders)
+        date = parse_date_from_folder(os.path.basename(selected_folder))
+        stock_returns = get_stock_returns(date, stock_list)
+
+        article_data = load_and_process_data(selected_folder, max_length)
+        x.append(torch.from_numpy(article_data.astype(np.int64)))
+        y.append(stock_returns)
+
+    x = torch.stack(x)
+    y = torch.tensor([list(returns.values()) for returns in y])  # Assuming returns are in the same order as stock_list
+
+    if device_type == 'cuda':
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+
+    return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
 
+# Test loader
+batch_size = 1
+block_size = 1024
+device_type = 'cuda'  # or 'cuda'
+device = torch.device(device_type)
+
+x_train, y_train = get_batch('train', batch_size, block_size, stock_list)
+print(x_train.shape, y_train.shape)
+print(x_train[0], y_train[0])
 # attempt to derive vocab_size from the dataset
 # meta_path = os.path.join(data_dir, 'meta.pkl')
 # meta_vocab_size = None
@@ -171,8 +243,8 @@ best_val_loss = checkpoint['best_val_loss']
 for param in model.parameters():
     param.requires_grad = False
 
-# Create the LLMForecaster model
-model = LLMForecaster(model, gptconf)
+# Create the LLMForecaster model ================================================================================
+model = LLMForecaster(model, context_length_multiplier, stock_list, gptconf)
 model.to(device)
 
 # 1. Check Model Loading
@@ -186,22 +258,6 @@ dummy_input = torch.randint(high=model_args['vocab_size'], size=(1, gptconf.bloc
 with torch.no_grad():
     gpt_output = model(dummy_input)
 print("GPT forward pass successful. Output value and shape:", gpt_output, gpt_output.shape)
-
-# # 3. Check Parameter Freezing
-# print("First parameter requires_grad:", next(model.parameters()).requires_grad)
-
-# # 4. Test Forward Pass of LLMForecaster
-# model = LLMForecaster(model, gptconf).to(device)
-# dummy_input = torch.randn(1, gptconf.block_size * model.context_length_multiplier, model_args['n_embd']).to(device)
-# with torch.no_grad():
-#     forecaster_output = model(dummy_input)
-# print("LLMForecaster forward pass successful. Output shape:", forecaster_output.shape)
-
-# # crop down the model block size if desired, using model surgery
-# if block_size < model.config.block_size:
-#     model.crop_block_size(block_size)
-#     model_args['block_size'] = block_size # so that the checkpoint will have the right value
-# model.to(device)
 
 # # initialize a GradScaler. If enabled=False scaler is a no-op
 # scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
