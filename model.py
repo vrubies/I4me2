@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+import time
 from dataclasses import dataclass
 
 import torch
@@ -52,7 +53,7 @@ class LLMForecaster(nn.Module):
         self.conv_dim_1 = 50
         resulting_len_1 = (self.block_size - self.kernel_size_1) + 1
         self.kernel_size_2 = self.kernel_size_1 // 4
-        self.conv_dim_2 = 10
+        self.conv_dim_2 = 20
         resulting_len_2 = (resulting_len_1 - self.kernel_size_2) + 1
 
         self.conv_blocks_1 = nn.ModuleList([
@@ -71,7 +72,7 @@ class LLMForecaster(nn.Module):
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size() # (b, t, n_embd)
         assert T <= self.max_tokens, f"Cannot forward sequence of length {T}, block size is over {self.max_tokens}"
 
@@ -84,7 +85,13 @@ class LLMForecaster(nn.Module):
         # Run the GPT model on each chunk
         all_processed_chunks = []
         for c in chunks:
-            hidden_states = self.frozenGPT(c, targets=None, return_hid=True)
+            # Measure time to compute each chunk
+            # start_time = time.time()  # Start time measurement
+            with torch.no_grad():
+                hidden_states = self.frozenGPT(c, targets=None, return_hid=True)
+                hidden_states = [h for h in hidden_states]
+            # end_time = time.time()  # End time measurement
+            # print(f"Time taken for processing chunk in GPU and moving back to CPU: {end_time - start_time:.4f} seconds")
             hidden_merged = torch.zeros_like(hidden_states[0]) # (B, T // self.num_chunks, C)
             assert len(hidden_states) == len(self.hidden_merger), f"Number of hidden states ({len(hidden_states)}) does not match number of hidden mergers ({len(self.hidden_merger)})"
             for h,m in zip(hidden_states, self.hidden_merger):
@@ -104,6 +111,11 @@ class LLMForecaster(nn.Module):
         outputs = self.linear_relu(outputs)
         outputs = self.linear_output(outputs)
         
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            loss = F.mse_loss(outputs, targets)
+            return loss
+
         return outputs
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
